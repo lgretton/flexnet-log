@@ -91,7 +91,7 @@ foreach $event (@rawdata) {
 
     $rdate = join('-', (split('/', $1))[2,0,1]);
 
-    # Fucking time component starts with a space sometimes. Let's remove it.
+    # Bloomin' time component starts with a space sometimes. Let's remove it.
     ($string = $event) =~ s/^\s//;
     # H:M:S where H and M are not zero-padded (S is!).
     $string =~ m/^([0-9]+:[0-9]+:[0-9][0-9])\s.*/;
@@ -526,11 +526,7 @@ Show the manual page.
 
 =head1 AUTHOR
 
-Liam Gretton <liam.gretton@leicester.ac.uk>
-
-=head1 REVISION
-
-$Id: flexnet-log 89 2014-12-17 10:33:55Z ljg2 $
+Liam Gretton <liam.gretton@gmail.com>
 
 =cut
 
