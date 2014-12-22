@@ -1,0 +1,536 @@
+#!/usr/bin/perl -w
+#
+# flexnet-log - FlexNET log sanitiser. Takes a FlexNET log file and makes it readable and amenable
+# to further analysis.
+#
+# 2014-12-17 - (Liam) Added --start and --end options and time period selection.
+# 2014-12-10 - (Liam) Created.
+
+use 5.010;
+use strict;
+use warnings;
+
+use Data::Dumper;
+use Date::Manip;
+use File::Slurp;
+use Getopt::Long qw(:config no_ignore_case :config bundling);
+use Pod::Usage;
+use POSIX qw(strftime);
+use Time::localtime;
+
+######################################################################################
+#
+# Main program start
+#
+######################################################################################
+
+# The tied array with the log file's raw data
+my @rawdata;
+
+# List of timestamp events (indexes into @rawdata)
+# @timestamps = ( date  => epoch secs,
+#                 index => index into @rawdata )
+my @timestamps;
+
+# The array of structs with the sanitised data
+# @data = ( date     => epoch secs,
+#           event    => in, out, denied, unsupported,
+#           duration => check-out duration (secs), ** UNUSED **
+#           user     => user name,
+#           host     => host name,
+#           feature  => feature )
+my @data;
+
+my $DEBUG;
+my $VERBOSE;
+my $HELP;
+my $LOGFILE;
+my $TIMESTART;
+my $TIMEEND;
+my $MANPAGE;
+
+GetOptions('h'       => \$HELP,
+           'v'       => \$VERBOSE,
+           'd'       => \$DEBUG,
+           'f=s'     => \$LOGFILE,
+           'start=s' => \$TIMESTART,
+           'end=s'   => \$TIMEEND,
+           'man'     => \$MANPAGE
+          ) or pod2usage(1);
+
+pod2usage(-verbose => 2, -exitval => 1) if $MANPAGE;
+pod2usage(1) if $HELP;
+
+# Validate start and end datetimes
+($TIMESTART, $TIMEEND) = times_validate($TIMESTART, $TIMEEND) or exit(1);
+
+# Validate and slurp log file
+logfile_validate($LOGFILE) or exit(1);
+
+@rawdata = read_file($LOGFILE, chomp => 1);
+
+my ($etime, $stime);
+my $event;
+my $i = 0;
+my $string;
+my ($rtime, $rdate, $esecs);
+
+$stime = time();
+$etime = $stime;
+
+# Build a list of indexes to TIMESTAMP events.
+# If start and end dates were specified, limit to (roughly) between those values
+foreach $event (@rawdata) {
+
+  # Quick match for TIMESTAMP here
+  if ( $event =~ m/TIMESTAMP/ ) {
+
+    # Convert the TIMESTAMP event's date+time to epoch secs
+    ($string = $event) =~ m/([0-9]+\/[0-9]+\/2[0-9][0-9][0-9])$/;
+    next if !$string;
+
+    $rdate = join('-', (split('/', $1))[2,0,1]);
+
+    # Fucking time component starts with a space sometimes. Let's remove it.
+    ($string = $event) =~ s/^\s//;
+    # H:M:S where H and M are not zero-padded (S is!).
+    $string =~ m/^([0-9]+:[0-9]+:[0-9][0-9])\s.*/;
+
+    $rtime = join(':', (split(':', $1))[0,1,2]);
+
+    # Convert to epoch secs
+    $esecs = UnixDate(ParseDate($rdate." ".$rtime), '%s');
+
+    # Only record TIMESTAMP if it's within the time period, but try to capture at least one either
+    # side of the specified start/end times too (we'll allow 25 hours either way)
+    if ( $esecs >= ($TIMESTART - 90000) && $esecs <= ($TIMEEND + 90000) ) {
+      # Shove this timestamp into our timestamp struct
+      push(@timestamps, { date => $esecs, index => $i });
+    }
+  }
+
+  $i++;
+}
+
+# If the first TIMESTAMP is greater than $TIMESTART, insert a dummy TIMESTAMP at the start.
+# This lets us capture those events that occur in a log file before any TIMESTAMP is found.
+if ( $timestamps[0]->{date} > $TIMESTART ) {
+  unshift(@timestamps, { date => $TIMESTART, index => 0 })
+}
+
+$etime = time();
+debug(scalar(@timestamps)." timestamp events found in ".pretty_time($etime - $stime)."\n");
+
+# Now start winding through the log file between TIMESTAMP events
+# We work backwards between TIMESTAMP events in order to track date changes
+# This is SLOW if we're processing all events on a large log file.
+my $i0;
+my $i1 = $timestamps[0]->{index};
+my $ntime;
+my ($etype, $user, $host, $feature);
+
+$stime = time();
+$etime = $stime;
+
+shift(@timestamps);
+
+foreach my $mark (@timestamps) {
+
+  # Start at (TIMESTAMP index - 1)
+  $i0    = $mark->{index} - 1;
+  $ntime = $mark->{date};
+
+  for ($i=$i0; $i>$i1; $i--) {
+    $event = $rawdata[$i];
+    # Get rid of any spaces at the start
+    $event =~ s/^\s//;
+
+    # *** May wish to process esecs for every row, not just those with interesting events
+    # *** in order to ensure that calculated datetime for the preceding event is accurate.
+    # Does this row have an event we're interested in?
+    if ( $event =~ m/( IN: | OUT: | DENIED: | UNSUPPORTED: )/ ) {
+
+      # Event type
+      $1 =~ m/([A-Z]+)/;
+      $etype = $1;
+
+      # Event time in epoch secs
+      $esecs = flexnet_parsetime(\$event, $ntime);
+
+      # Skip event if it's outside the specified time period
+      next if ( $esecs < $TIMESTART || $esecs > $TIMEEND );
+
+      # Feature
+      $feature = (split(' ', $event))[3];
+      $feature =~ s/\"//g;
+
+      # user@host. Not in a fixed column thanks to UNSUPPORTED events.
+      $event =~ m/ ([a-z]+[_\-a-z0-9]*@[a-z]+[_\.\-a-z0-9]*) /i;
+
+      ($user, $host) = split('@', $1);
+
+      if ( !$user || !$host ) {
+        print STDERR "Could not parse user/host (line ".$i."): ".$event."\n";
+      }
+
+      # Sling this event's details into our array of event structs
+      push(@data, { date => $esecs, event => $etype,
+                    duration => 0, user => $user, host => $host, feature => $feature });
+
+    }
+    $ntime = $esecs;
+  }  
+  
+  $i1 = $mark->{index} + 1;
+}
+
+# We don't need the original data any more
+undef(@rawdata);
+
+$etime = time();
+debug("Log parsed in ".pretty_time($etime - $stime)."\n");
+
+$stime = time();
+$etime = $stime;
+
+my ($firstevent, $lastevent);
+
+# Events are not in order, so we must sort on date while dealing with output
+foreach $event ( sort { $a->{date} <=> $b->{date} } @data ) {
+
+  # Record first event's timestamp
+  if ( !$firstevent ) {
+    $firstevent = $event->{date};
+  }
+
+  $lastevent = $event->{date};
+
+  print strftime("%Y-%m-%d %H:%M:%S", gmtime($event->{date}))." ";
+  print $event->{feature}." ".$event->{event}." ".$event->{user}." ".$event->{host}."\n";
+}
+
+$etime = time();
+
+debug("Log starts: ".strftime("%Y-%m-%d %H:%M:%S", gmtime($firstevent))."\n");
+debug("Log ends: ".strftime("%Y-%m-%d %H:%M:%S", gmtime($lastevent))."\n");
+debug("Log entries processed in ".pretty_time($etime - $stime)."\n");
+
+exit(0);
+
+######################################################################################
+#
+# Functions
+#
+######################################################################################
+
+# debug() just sends its argument to stderr if DEBUG is defined ('DEBUG: ' is prepended)
+#
+# Args:
+# 0 - stuff to write
+
+sub debug {
+
+  if ( ! $DEBUG ) { return; }
+
+  my @lines = split('\n', $_[0]);
+
+  foreach (@lines) {
+    print STDERR "DEBUG: $_\n";
+  }
+
+  return;
+}
+
+# verbose() just send its argument to stdout if VERBOSE is defined.
+#
+# Args:
+# 0 - stuff to write
+
+sub verbose {
+
+  if ( ! $VERBOSE ) { return; }
+
+  print STDOUT "$_[0]";
+
+  return;
+}
+
+# pretty_time() takes a value in seconds and returns a string in the form HH:MM:SS
+#
+# Args:
+# 0 - seconds
+#
+# Returns:
+# HH:MM:SS or undefined if input is dodgy
+
+sub pretty_time {
+
+  my $ttime = $_[0];
+
+  if ( !defined($ttime) ) { return; }
+
+  return strftime("\%H:\%M:\%S", gmtime($ttime));
+}
+
+# times_validate() validates the start and end datetimes.
+# Values can be in anything that ParseDate() can handle.
+# If not specified, then start = 0, end = tomorrow.
+# This function reports its own errors.
+#
+# Args:
+# 0 - start datetime
+# 1 - end datetime
+#
+# Returns:
+# (stime, etime) in epoch secs
+
+sub times_validate {
+
+  my $stime = $_[0];
+  my $etime = $_[1];
+
+  if ( $stime ) {
+    $stime = UnixDate(ParseDate($stime), "%s");
+  } else {
+    # Pick a suitable time waaaaay back in the past
+    $stime = 0;
+  }
+  
+  if ( $etime ) {
+    $etime = UnixDate(ParseDate($etime), "%s");
+  } else {
+    # Pick a suitable time waaaaay back in the past
+    $etime = UnixDate(ParseDate("tomorrow"), "%s");
+  }
+
+  # Avoid events in the future
+  if ( $stime >= time() ) {
+    print STDERR "Cannot start with events in the future\n";
+    return;
+  }
+
+  # Start time must be before end time
+  if ( $etime <= $stime ) {
+    print STDERR "End datetime must be after start datetime\n";
+    return;
+  }
+
+  return($stime, $etime);
+}
+
+# logfile_validate() does some simple checks to ensure the specified log file is valid.
+# This function reports its own errors.
+#
+# Args:
+# 0 - log file
+#
+# Returns:
+# TRUE if valid, FALSE otherwise.
+
+sub logfile_validate {
+
+  my $logfile = $_[0];
+  my $FH;
+
+  if ( !$logfile ) {
+    print STDERR "No log file specified\n";
+    exit(1);
+  }
+
+  if ( ! -r $logfile ) {
+    print STDERR "Cannot read log file '".$logfile."'\n";
+    return(0);
+  }
+
+  if ( -d $logfile ) {
+    print STDERR "'".$logfile."' is a directory\n";
+    return(0);
+  }
+
+  # Check the contents, does it look ok? We'll just look for TIMESTAMP d/m/yyyy.
+  open($FH, '<', $logfile);
+
+  while (<$FH>) {
+    # Beware! This regex is only valid until the year 2999, don't forget to modify by 3000.
+    return(1) if m/TIMESTAMP [0-9]+\/[0-9]+\/2[0-9][0-9][0-9]/;
+  }
+
+  # Got here: no TIMESTAMP found
+  print STDERR "'".$logfile."' does not look like a FlexNET log file\n";
+
+  return(0);
+}
+
+# flexnet_parsetime() takes a FlexNET log entry and a value of the next event's timestamp and
+# returns a timestamp value in UTC epoch seconds.
+#
+# Args:
+# 0 - reference to log entry
+# 1 - timestamp of next known entry (UTC epoch secs)
+#
+# Returns:
+# Entry time in UTC epoch secs, undefined on failure
+
+sub flexnet_parsetime {
+
+  my $entryref  = $_[0];
+  my $nextesecs = $_[1];
+
+  my $entry;
+  my $ntm;
+  my $thisesecs;
+
+  # Extract the time
+  $entry = (split(' ', $$entryref))[0];
+  $entry = join(':', (split(':', $entry))[0,1,2]);
+
+  # Assume date is same as that in next entry (note: this converts from UTC to local time)
+  $ntm = localtime($nextesecs);
+  
+  $entry = $entry." ".(1900+$ntm->year)."-".($ntm->mon+1)."-".$ntm->mday;
+
+  # Convert to epoch secs
+  $thisesecs = UnixDate(ParseDate($entry), '%s');
+
+  # ...and subtract a day if it's larger than the next entry's time
+  if ( $thisesecs > $nextesecs ) {
+    $thisesecs -= 86400;
+  }
+
+  return($thisesecs);
+}
+
+# END() is called when the program ends.
+
+sub END {
+
+}
+
+__END__
+
+=head1 NAME
+
+flexnet-log - sanitise FlexNET log files
+
+=head1 SYNOPSIS
+
+flexnet-log [options] -f file
+
+  Options:
+    -f file         Log file name to process
+    --start time    Ignore events before this datetime
+    --end   time    Ignore events after this datetime
+    -d              Debugging on
+    -h              Show help message
+    --man           Show full documentation
+
+=head1 DESCRIPTION
+
+B<flexnet-log> sanitises the specified FlexNET log file and returns helpfully formatted event data.
+
+FlexNET log files aren't very friendly. There is a time logged (with no date) for events, and a
+time/date marker called TIMESTAMP added to the log file every six hours.
+
+B<flexnet-log> parses these log files and can output the data in a format that's more amenable to
+further analysis.
+
+First a list of TIMESTAMP events is built. Then it works backwards through the events between these
+and records a full timestamp for each. Interesting events that are exanined are:
+
+=over
+
+=item B<OUT>
+
+a license is checked out
+
+=item B<IN>
+
+a license is checked back in
+
+=item B<DENIED>
+
+an attempt to check out a license is denied
+
+=item B<UNSUPPORTED>
+
+an attempt to check out a license for an unsupported feature
+
+=back
+
+For each of these the following information is recorded:
+
+=over
+
+=item B<datetime>
+
+date and time of event
+
+=item B<event>
+
+IN, OUT, DENIED or UNSUPPORTED
+
+=item B<feature>
+
+the license feature in question
+
+=item B<user>
+
+the user name associated with the event
+
+=item B<host>
+
+the host associated with the event
+
+=back
+
+Note that FlexNET trusts the client to provide useful user and host name information.
+
+There's no way of reliably matching OUT events with corresponding IN events, so it's not possible
+to determine how long a license has been used for.
+
+=over
+
+=item B<-f> file
+
+The FlexNET log file to be processed. The entire file is imported, then rebuilt in memory in a new
+structure.
+
+=item B<--start> time
+
+A start time: events prior to this in the log file will not be output. The values that this option
+accepts are anything that I<Date::Manip::ParseDate()> will accept (e.g. B<yesterday>,
+B<"2014-01-01 15:40:00">).
+
+If no value is specified, the log file is processed from the first event found.
+
+=item B<--end> time
+
+An end time: events after this in the log file will not be output. This option accepts the same
+style of values as the B<--start> option.
+
+If no value is specified, the log file is processed to the final event found.
+
+=item B<-d>
+
+Show some debugging output.
+
+=item B<-h>
+
+Show basic help information.
+
+=item B<--man>
+
+Show the manual page.
+
+=back
+
+=head1 AUTHOR
+
+Liam Gretton <liam.gretton@leicester.ac.uk>
+
+=head1 REVISION
+
+$Id: flexnet-log 89 2014-12-17 10:33:55Z ljg2 $
+
+=cut
+
